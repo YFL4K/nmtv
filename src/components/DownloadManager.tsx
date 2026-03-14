@@ -8,6 +8,7 @@ import { downloadM3U8Video, DownloadProgress, M3U8Task, parseM3U8, PauseResumeCo
 
 import AddDownloadModal from './AddDownloadModal';
 import SegmentViewer from './SegmentViewer';
+import { formatTime } from '@/lib/formatTime';
 
 
 interface DownloadTask {
@@ -205,6 +206,9 @@ const DownloadManager = ({ isOpen, onClose }: DownloadManagerProps) => {
             // 如果正在提前完成，不更新状态（状态会在立即保存时手动更新）
             if (t.isEarlyCompleting) return t;
 
+            // 只有任务本身是 downloading 时才允许更新状态，避免手动暂停被覆盖
+            const shouldUpdateStatus = t.status === 'downloading';
+
             // 创建新的 parsedTask 引用以触发重新渲染
             // 注意：downloadedSegments 是 Map，需要保持引用以便数据共享
             // 重要：finishList 也保持引用，避免覆盖手动重试的状态
@@ -223,7 +227,9 @@ const DownloadManager = ({ isOpen, onClose }: DownloadManagerProps) => {
               progress: prog.percentage,
               current: prog.current,
               total: prog.total,
-              status: prog.status === 'done' ? 'completed' : prog.status === 'error' ? 'error' : 'downloading',
+              status: shouldUpdateStatus
+                ? (prog.status === 'done' ? 'completed' : prog.status === 'error' ? 'error' : 'downloading')
+                : t.status,
               parsedTask: updatedParsedTask,
             };
           }));
@@ -325,7 +331,7 @@ const DownloadManager = ({ isOpen, onClose }: DownloadManagerProps) => {
         startSegment: config.startSegment,
         endSegment: config.endSegment,
         streamMode: config.streamMode,
-        maxRetries: config.maxRetries,
+          maxRetries: config.maxRetries ?? 3,
         parsedTask: config.parsedTask,
       },
       parsedTask: config.parsedTask, // 保存片段信息
@@ -381,7 +387,7 @@ const DownloadManager = ({ isOpen, onClose }: DownloadManagerProps) => {
           startSegment: config.startSegment,
           endSegment: config.endSegment,
           streamMode: config.streamMode,
-          maxRetries: config.maxRetries || 3,
+          maxRetries: config.maxRetries ?? 3,
           parsedTask: config.parsedTask,
         },
         parsedTask: config.parsedTask, // 保存片段信息
@@ -406,7 +412,7 @@ const DownloadManager = ({ isOpen, onClose }: DownloadManagerProps) => {
           config.startSegment,
           config.endSegment,
           config.streamMode,
-          config.maxRetries || 3,
+          config.maxRetries ?? 3,
           completeStreamRef
         );
       }, 0);
@@ -441,7 +447,7 @@ const DownloadManager = ({ isOpen, onClose }: DownloadManagerProps) => {
         : t
     ));
 
-    executeDownload(taskId, parsedTask, controller, pauseResumeController, downloadType, concurrency, rangeMode, startSegment, endSegment, streamMode || 'disabled', maxRetries || 3, completeStreamRef);
+    executeDownload(taskId, parsedTask, controller, pauseResumeController, downloadType, concurrency, rangeMode, startSegment, endSegment, streamMode || 'disabled', maxRetries ?? 3, completeStreamRef);
   }, [executeDownload]);
 
   // 删除任务
@@ -797,15 +803,40 @@ const DownloadManager = ({ isOpen, onClose }: DownloadManagerProps) => {
                             {task.config.concurrency} 线程
                           </span>
                           {task.config.rangeMode && (
-                            <span className="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-orange-100 text-orange-800 dark:bg-orange-900/30 dark:text-orange-400">
-                              范围: {task.config.startSegment}-{task.config.endSegment}
-                            </span>
+                            (() => {
+                              // 计算时长范围
+                              let startTime = 0, endTime = 0;
+                              if (task.parsedTask && Array.isArray(task.parsedTask.segmentDurations)) {
+                                const { startSegment, endSegment } = task.parsedTask.rangeDownload;
+                                const segs = task.parsedTask.segmentDurations;
+                                startTime = segs.slice(0, startSegment - 1).reduce((a, b) => a + b, 0);
+                                endTime = segs.slice(0, endSegment).reduce((a, b) => a + b, 0);
+                              }
+                              // 格式化
+                              // 使用统一的 formatTime
+                              return (
+                                <span className="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-orange-100 text-orange-800 dark:bg-orange-900/30 dark:text-orange-400">
+                                  范围: {task.config.startSegment}-{task.config.endSegment}
+                                  {task.parsedTask && task.parsedTask.segmentDurations && task.parsedTask.segmentDurations.length > 0 && (
+                                    <>
+                                      &nbsp;|&nbsp;时长: {formatTime(startTime)} ~ {formatTime(endTime)}
+                                    </>
+                                  )}
+                                </span>
+                              );
+                            })()
                           )}
-                          {task.parsedTask && task.parsedTask.errorNum > 0 && (
-                            <span className="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-red-100 text-red-800 dark:bg-red-900/30 dark:text-red-400">
-                              失败: {task.parsedTask.errorNum} 个片段
-                            </span>
-                          )}
+                          {task.parsedTask && (() => {
+                            // 直接同步 SegmentViewer 的失败片段统计逻辑
+                            const { startSegment, endSegment } = task.parsedTask.rangeDownload;
+                            const filteredSegments = task.parsedTask.finishList.slice(startSegment - 1, endSegment);
+                            const errorCount = filteredSegments.filter(item => item.status === 'error').length;
+                            return errorCount > 0 ? (
+                              <span className="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-red-100 text-red-800 dark:bg-red-900/30 dark:text-red-400">
+                                失败: {errorCount} 个片段
+                              </span>
+                            ) : null;
+                          })()}
                         </div>
                       )}
                     </div>
@@ -992,7 +1023,7 @@ const DownloadManager = ({ isOpen, onClose }: DownloadManagerProps) => {
                                 task.status === 'paused' ? '已暂停' : '等待中'}
                       </span>
                       <span className="text-gray-600 dark:text-gray-400">
-                        {task.progress.toFixed(1)}%
+                        {Math.floor(task.progress)}%
                       </span>
                     </div>
                     <div className="w-full bg-gray-200 dark:bg-gray-600 rounded-full h-2">
