@@ -213,6 +213,26 @@ const LAST_CACHE_VIDEO_KEY = 'moontv:last-cache-video';
 /** 首次进入播放页时提示一次帮助入口 */
 const HELP_TIP_SEEN_KEY = 'moontv:help-tip-seen';
 
+/** 标记是否已执行过「视频缓存默认开启」初始化，确保用户手动关闭后依然生效 */
+const DEFAULT_VIDEO_CACHE_INIT_KEY = 'moontv:default-video-cache-enabled-v1';
+
+/**
+ * 确保视频缓存功能默认开启。
+ * 若本地尚未初始化过默认开启状态，则自动写入 `enabled: true` 到缓存设置中，
+ * 使 `loadCacheSettings().enabled` 及底层 `VideoPrefetcher` 统一默认开启。
+ */
+function ensureDefaultVideoCacheEnabled(): void {
+  if (typeof window === 'undefined') return;
+  try {
+    if (window.localStorage.getItem(DEFAULT_VIDEO_CACHE_INIT_KEY) !== '1') {
+      saveCacheSettings({ enabled: true });
+      window.localStorage.setItem(DEFAULT_VIDEO_CACHE_INIT_KEY, '1');
+    }
+  } catch {
+    // 隐私模式等场景下 localStorage 不可用时忽略
+  }
+}
+
 function readLastCacheVideoKey(): string | null {
   try {
     return window.sessionStorage.getItem(LAST_CACHE_VIDEO_KEY);
@@ -271,6 +291,9 @@ function buildCacheTooltip(
  * 返回一个包含渲染所需状态/回调的对象，供 {@link PlayClient} 组合展示。
  */
 export function usePlayEngine() {
+  // 初始化时确保视频缓存默认处于开启状态（仅首次生效，不影响后续手动关闭）
+  ensureDefaultVideoCacheEnabled();
+
   const searchParams = useSearchParams();
 
   // -----------------------------------------------------------------------------
@@ -328,7 +351,7 @@ export function usePlayEngine() {
 
   const [isBlockAdChanged, setIsBlockAdChanged] = useState(false);
   /**
-   * 「去广告」开关。
+   * 「去广告」开关（已修改为默认开启）。
    *
    * 开启后从点播播放列表中剔除广告分片，识别依据：
    *  - SCTE-35 `#EXT-X-CUE-OUT` / `#EXT-X-CUE-IN` 广告窗；
@@ -336,14 +359,13 @@ export function usePlayEngine() {
    *  - 被长内容夹住的 15–30s 中插短块。
    * 不连续标记、KEY、MAP 全部保留，因此不会产生旧实现那种时间轴空洞。
    *
-   * 使用 v2 key：旧 key 对应"只删 `#EXT-X-DISCONTINUITY`"的旧实现，
-   * 不再沿用旧值。
+   * 使用 v2 key：未设置或不为 'false' 时均默认开启。
    */
   const [blockAdEnabled, setBlockAdEnabled] = useState<boolean>(() => {
     if (typeof window !== 'undefined') {
-      return localStorage.getItem('enable_blockad_v2') === 'true';
+      return localStorage.getItem('enable_blockad_v2') !== 'false';
     }
-    return false;
+    return true;
   });
   const blockAdEnabledRef = useRef(blockAdEnabled);
   useEffect(() => {
@@ -3206,566 +3228,4 @@ export function usePlayEngine() {
         // 暂停是预缓存的"黄金窗口"：播放不再抢带宽，缓存应当全速继续。
         // 1) 解除 stall 让路。否则若用户正好在卡顿时按暂停，video:playing
         //    永远不会再触发，预取会被永久挂起——恰好违背"暂停也继续缓存"。
-        // 2) 明确要求"不设时间上限"：把整集剩余分片全部排进队列，暂停越久
-        //    缓存铺得越远；字节上限与 LRU 淘汰才是这条路的兜底。
-        //    走 ensurePrefetchCurrent 而不是闭包里的 videoUrl——播放器跨集复用，
-        //    闭包里的地址可能是上一集的。
-        setCacheBandwidthThrottled(false);
-        ensurePrefetchCurrent(
-          artPlayerRef.current.currentTime || 0,
-          UNLIMITED_HORIZON_SECONDS
-        );
-      });
-
-      // ---------------------------------------------------------------------
-      // 前向预缓存：窗口维护
-      // ---------------------------------------------------------------------
-      // 跳转开始即中止旧请求，保留统计和已写入缓存；落点确定后重新排队。
-      artPlayerRef.current.on('video:seeking', () => {
-        // 记录 seek 时间：紧接着的 waiting 是"跳过去还在下载"，不是网络波动
-        lastSeekAtRef.current = Date.now();
-        prefetcherRef.current.stop(true);
-        setCacheBandwidthThrottled(true);
-      });
-      artPlayerRef.current.on('video:seeked', () => {
-        lastSeekAtRef.current = Date.now();
-        prefetcherRef.current.stop(true);
-        ensurePrefetchCurrent(artPlayerRef.current.currentTime || 0);
-      });
-
-      // 播放卡顿时让出带宽，恢复后继续预取。
-      // 注意：这是"临时让路"，不是"视频暂停就停缓存"。
-      artPlayerRef.current.on('video:waiting', () => {
-        const media = artPlayerRef.current?.video;
-        setCacheBandwidthThrottled(!media?.paused);
-
-        // —— 弱网自动降档 ——
-        // 只有"边播边等"才算卡顿：seek、ABR 换档、换源都会让 hls.js 重新
-        // 缓冲并立刻抛一次 waiting，它们说明不了带宽。把这类等待算成卡顿，
-        // 每拖一次进度条就会压一次 ABR 上限；而每次换档又会 flush 前向缓冲，
-        // 正在等数据的 seek 因此被打回旧位置——这就是"越拖越回退"的死循环。
-        const now = Date.now();
-        if (
-          !media ||
-          media.seeking ||
-          media.readyState === 0 ||
-          now - lastSeekAtRef.current < STALL_GRACE_AFTER_SEEK_MS ||
-          now - lastLevelSwitchAtRef.current < STALL_GRACE_AFTER_LEVEL_SWITCH_MS
-        ) {
-          return;
-        }
-        // 5 秒内的重复事件只记一次；2 分钟内累计 4 次视为网络跟不上当前档位，
-        // 把 ABR 上限压一档。
-        const stalls = stallTimesRef.current;
-        if (stalls.length === 0 || now - stalls[stalls.length - 1] >= 5_000) {
-          stalls.push(now);
-        }
-        while (stalls.length > 0 && now - stalls[0] > 120_000) {
-          stalls.shift();
-        }
-
-        const hls = artPlayerRef.current?.video?.hls;
-        if (!hls) return;
-        if (stalls.length < 4) return;
-
-        // 决策下沉到 decideDownshift()：手动锁档不插手，
-        // **单档位源直接判定"无可降档"**（压 ABR 上限只会把唯一一档钉死，
-        // 还会白触发一次换档 flush），只有真正多档位时才压上限。
-        const decision = decideDownshift({
-          levels: Array.isArray(hls.levels) ? hls.levels : [],
-          autoLevelEnabled: hls.autoLevelEnabled === true,
-          currentLevel:
-            typeof hls.loadLevel === 'number' && hls.loadLevel >= 0
-              ? hls.loadLevel
-              : typeof hls.currentLevel === 'number' && hls.currentLevel >= 0
-              ? hls.currentLevel
-              : 0,
-          autoLevelCapping: hls.autoLevelCapping,
-        });
-
-        if (decision.action === 'none') return;
-
-        if (decision.action === 'advise-source') {
-          // 已经无可降，只能提示换源；同一个原因只弹一次
-          if (downshiftNoticeRef.current !== decision.reason) {
-            downshiftNoticeRef.current = decision.reason;
-            pushPlayerNotice(
-              artPlayerRef.current,
-              decision.reason === 'single-level'
-                ? '当前片源只有一档画质，卡顿建议更换播放源'
-                : '已降至最低画质仍卡顿，建议在右侧换一个播放源',
-              { key: 'downshift' }
-            );
-          }
-          return;
-        }
-
-        hls.autoLevelCapping = decision.nextCap;
-        if (downshiftNoticeRef.current !== `cap-${decision.nextCap}`) {
-          downshiftNoticeRef.current = `cap-${decision.nextCap}`;
-          pushPlayerNotice(
-            artPlayerRef.current,
-            '检测到网络较慢，已自动降低画质以减少卡顿',
-            { key: 'downshift' }
-          );
-        }
-      });
-      artPlayerRef.current.on('video:playing', () => {
-        syncCacheBandwidth(true);
-      });
-      artPlayerRef.current.on('video:progress', () => syncCacheBandwidth());
-
-      // 如果播放器初始化时已经在播放状态，则请求 Wake Lock
-      if (artPlayerRef.current && !artPlayerRef.current.paused) {
-        requestWakeLock();
-      }
-
-      artPlayerRef.current.on('video:volumechange', () => {
-        lastVolumeRef.current = artPlayerRef.current.volume;
-      });
-      artPlayerRef.current.on('video:ratechange', () => {
-        lastPlaybackRateRef.current = artPlayerRef.current.playbackRate;
-      });
-
-      // 监听视频可播放事件，这时恢复播放进度更可靠
-      artPlayerRef.current.on('video:canplay', () => {
-        // 若存在需要恢复的播放进度，则跳转
-        if (resumeTimeRef.current && resumeTimeRef.current > 0) {
-          try {
-            const duration = artPlayerRef.current.duration || 0;
-            let target = resumeTimeRef.current;
-            if (duration && target >= duration - 2) {
-              target = Math.max(0, duration - 5);
-            }
-            artPlayerRef.current.currentTime = target;
-            console.log('成功恢复播放进度到:', resumeTimeRef.current);
-          } catch (err) {
-            console.warn('恢复播放进度失败:', err);
-          }
-        }
-        resumeTimeRef.current = null;
-
-        setTimeout(() => {
-          if (
-            Math.abs(artPlayerRef.current.volume - lastVolumeRef.current) > 0.01
-          ) {
-            artPlayerRef.current.volume = lastVolumeRef.current;
-          }
-          if (
-            Math.abs(
-              artPlayerRef.current.playbackRate - lastPlaybackRateRef.current
-            ) > 0.01 &&
-            isWebkit
-          ) {
-            artPlayerRef.current.playbackRate = lastPlaybackRateRef.current;
-          }
-          artPlayerRef.current.notice.show = '';
-        }, 0);
-
-        // 隐藏换源加载状态
-        setIsVideoLoading(false);
-      });
-
-      // 监听视频时间更新事件：播放进度自动保存 + 跳过片头片尾
-      // （两个逻辑合并到同一个监听器，避免重复注册 timeupdate）
-      artPlayerRef.current.on('video:timeupdate', () => {
-        const now = Date.now();
-        syncCacheBandwidth();
-
-        // —— 播放进度自动保存 ——
-        // 间隔优先读取站点配置（RUNTIME_CONFIG.PLAYBACK_SAVE_INTERVAL，单位秒），
-        // 未配置时回退到存储类型默认值（Upstash 20s，其余 5s）
-        const configuredInterval =
-          typeof window !== 'undefined'
-            ? Number((window as any).RUNTIME_CONFIG?.PLAYBACK_SAVE_INTERVAL)
-            : 0;
-        const saveInterval =
-          configuredInterval > 0
-            ? configuredInterval * 1000
-            : getDefaultPlaybackSaveInterval(
-                process.env.NEXT_PUBLIC_STORAGE_TYPE
-              ) * 1000;
-        if (now - lastSaveTimeRef.current > saveInterval) {
-          saveCurrentPlayProgress();
-          lastSaveTimeRef.current = now;
-        }
-
-        // —— 前向预缓存窗口续跑 ——
-        // 播放自然推进（未触发 seek）时，每 30 秒检查一次窗口余量并续跑
-        if (now - lastPrefetchCheckRef.current > 30_000) {
-          lastPrefetchCheckRef.current = now;
-          ensurePrefetchCurrent(artPlayerRef.current.currentTime || 0);
-        }
-
-        // —— 跳过片头片尾 ——
-        if (!skipConfigRef.current.enable) return;
-
-        const currentTime = artPlayerRef.current.currentTime || 0;
-        const duration = artPlayerRef.current.duration || 0;
-
-        // 限制跳过检查频率为1.5秒一次
-        if (now - lastSkipCheckRef.current < 1500) return;
-        lastSkipCheckRef.current = now;
-
-        // 跳过片头
-        if (
-          skipConfigRef.current.intro_time > 0 &&
-          currentTime < skipConfigRef.current.intro_time
-        ) {
-          artPlayerRef.current.currentTime = skipConfigRef.current.intro_time;
-          artPlayerRef.current.notice.show = `已跳过片头 (${formatTime(
-            skipConfigRef.current.intro_time
-          )})`;
-        }
-
-        // 跳过片尾
-        if (
-          skipConfigRef.current.outro_time < 0 &&
-          duration > 0 &&
-          currentTime >
-            artPlayerRef.current.duration + skipConfigRef.current.outro_time
-        ) {
-          if (
-            currentEpisodeIndexRef.current <
-            (detailRef.current?.episodes?.length || 1) - 1
-          ) {
-            handleNextEpisode();
-          } else {
-            artPlayerRef.current.pause();
-          }
-          artPlayerRef.current.notice.show = `已跳过片尾 (${formatTime(
-            skipConfigRef.current.outro_time
-          )})`;
-        }
-      });
-
-      artPlayerRef.current.on('error', (err: any) => {
-        console.error('播放器错误:', err);
-        if (artPlayerRef.current.currentTime > 0) {
-          return;
-        }
-      });
-
-      // 监听视频播放结束事件：释放 Wake Lock 并自动播放下一集
-      artPlayerRef.current.on('video:ended', () => {
-        releaseWakeLock();
-        const d = detailRef.current;
-        const idx = currentEpisodeIndexRef.current;
-        if (d && d.episodes && idx < d.episodes.length - 1) {
-          setTimeout(() => {
-            handleNextEpisode();
-          }, 1000);
-        }
-      });
-
-      if (artPlayerRef.current?.video) {
-        ensureVideoSource(
-          artPlayerRef.current.video as HTMLVideoElement,
-          videoUrl
-        );
-      }
-    } catch (err) {
-      console.error('创建播放器失败:', err);
-      setError('播放器初始化失败');
-    }
-  }, [
-    libsReady,
-    videoUrl,
-    loading,
-    blockAdEnabled,
-    currentEpisodeIndex,
-    detail,
-  ]);
-
-  // -----------------------------------------------------------------------------
-  // 进度条悬停预览
-  // -----------------------------------------------------------------------------
-
-  // 抽帧器实例生命周期：切集 / 换源 / 去广告开关变化时重建，
-  // 其 loader 配置与主播放器完全一致，保证预览分片同样命中 Cache Storage / 同源代理。
-  useEffect(() => {
-    if (!libsReady || !videoUrl) return;
-    const Hls = hlsLibRef.current;
-    if (!Hls) return;
-
-    const thumb = new PreviewThumbnailer();
-    previewThumbnailerRef.current?.destroy();
-    previewThumbnailerRef.current = thumb;
-    thumb.load(
-      videoUrl,
-      Hls,
-      createCustomHlsLoader(Hls, {
-        blockAd: blockAdEnabledRef.current,
-        useProxy: loadCacheSettings().useProxy,
-        // 预览抽帧不计入「缓存命中率」诊断，避免污染主播放器统计
-        onProbe: () => undefined,
-      })
-    );
-    setPreview(null);
-
-    return () => {
-      thumb.destroy();
-      if (previewThumbnailerRef.current === thumb) {
-        previewThumbnailerRef.current = null;
-      }
-    };
-  }, [libsReady, videoUrl, blockAdEnabled]);
-
-  // 鼠标悬停及拖动处理器共享预览；触摸抽帧串行执行，避免移动时反复取消。
-  // playerHost 变化代表播放器已重建（进度条 DOM 换新），需重新绑定。
-  useEffect(() => {
-    if (!playerHost) return;
-    const progressEl =
-      (artPlayerRef.current?.template?.$progress as HTMLElement | null) ||
-      (playerHost.querySelector('.art-progress') as HTMLElement | null);
-    if (!progressEl) return;
-
-    let dragging = false;
-    let touchTime: number | null = null;
-    let capturingTouch = false;
-    let capturedTouchTime: number | null = null;
-
-    const scheduleTouchCapture = () => {
-      if (
-        touchTime === null ||
-        capturingTouch ||
-        previewTimerRef.current !== null ||
-        touchTime === capturedTouchTime
-      ) {
-        return;
-      }
-      const id = previewRequestIdRef.current;
-      previewTimerRef.current = window.setTimeout(() => {
-        previewTimerRef.current = null;
-        const thumb = previewThumbnailerRef.current;
-        const time = touchTime;
-        if (!thumb || time === null) return;
-        capturingTouch = true;
-        capturedTouchTime = time;
-        thumb.capture(time).then((image) => {
-          if (id !== previewRequestIdRef.current) return;
-          capturingTouch = false;
-          // 保留上一帧直到新帧就绪；移动中的时间标签仍实时更新。
-          if (image) {
-            setPreview((p) => (p?.visible ? { ...p, image } : p));
-          }
-          scheduleTouchCapture();
-        });
-      }, 120);
-    };
-
-    const showPreview = (ratio: number, input: 'mouse' | 'touch') => {
-      const duration = artPlayerRef.current?.duration || 0;
-      if (!Number.isFinite(duration) || duration <= 0) return;
-      const time = ratio * duration;
-      setPreview((p) => ({
-        visible: true,
-        time,
-        left:
-          input === 'touch' || artLibRef.current?.utils?.isMobile
-            ? 50
-            : ratio * 100,
-        image: p?.visible ? p.image : null,
-      }));
-      if (input === 'touch') {
-        touchTime = time;
-        scheduleTouchCapture();
-        return;
-      }
-      // 先使已在进行中的抽帧失效，避免旧图串到新位置
-      const id = ++previewRequestIdRef.current;
-      previewThumbnailerRef.current?.cancel();
-
-      if (previewTimerRef.current != null)
-        clearTimeout(previewTimerRef.current);
-      previewTimerRef.current = window.setTimeout(() => {
-        previewTimerRef.current = null;
-        const thumb = previewThumbnailerRef.current;
-        if (!thumb) return;
-        thumb.capture(time).then((image) => {
-          if (id !== previewRequestIdRef.current) return;
-          setPreview((p) =>
-            image && p && p.visible && Math.abs(p.time - time) < 0.5
-              ? { ...p, image }
-              : p
-          );
-        });
-      }, 120);
-    };
-
-    const hidePreview = () => {
-      dragging = false;
-      touchTime = null;
-      capturedTouchTime = null;
-      capturingTouch = false;
-      if (previewTimerRef.current != null) {
-        clearTimeout(previewTimerRef.current);
-        previewTimerRef.current = null;
-      }
-      previewRequestIdRef.current++;
-      previewThumbnailerRef.current?.cancel();
-      setPreview((p) => (p ? { ...p, visible: false } : p));
-    };
-
-    const onDragMove = (event: Event) => {
-      const { ratio, input } = (event as CustomEvent<ProgressPreviewMove>)
-        .detail;
-      if (!dragging && input === 'touch') hidePreview();
-      dragging = true;
-      showPreview(ratio, input);
-    };
-    const onPointerMove = (e: PointerEvent) => {
-      // 触摸由拖动处理器驱动，不依赖浏览器是否产生 pointermove。
-      if (e.pointerType === 'touch' || dragging) return;
-      const rect = progressEl.getBoundingClientRect();
-      const rotated = artPlayerRef.current?.isRotate;
-      const size = rotated ? rect.height : rect.width;
-      if (size <= 0) return;
-      const offset = rotated ? e.clientY - rect.top : e.clientX - rect.left;
-      showPreview(Math.min(1, Math.max(0, offset / size)), 'mouse');
-    };
-    const onPointerLeave = () => {
-      if (!dragging) hidePreview();
-    };
-
-    progressEl.addEventListener(PROGRESS_PREVIEW_MOVE, onDragMove);
-    progressEl.addEventListener(PROGRESS_PREVIEW_END, hidePreview);
-    progressEl.addEventListener('pointermove', onPointerMove);
-    progressEl.addEventListener('pointerleave', onPointerLeave);
-
-    return () => {
-      progressEl.removeEventListener(PROGRESS_PREVIEW_MOVE, onDragMove);
-      progressEl.removeEventListener(PROGRESS_PREVIEW_END, hidePreview);
-      progressEl.removeEventListener('pointermove', onPointerMove);
-      progressEl.removeEventListener('pointerleave', onPointerLeave);
-      hidePreview();
-      setPreview(null);
-    };
-  }, [playerHost]);
-
-  // 当组件卸载时清理定时器、Wake Lock 和播放器资源
-  useEffect(() => {
-    // 监听页面可见性变化
-    const handleVisibilityChange = () => {
-      if (
-        !document.hidden &&
-        artPlayerRef.current &&
-        !artPlayerRef.current.paused
-      ) {
-        // 页面变为可见且视频正在播放时，重新请求 Wake Lock
-        requestWakeLock();
-      } else if (document.hidden) {
-        // 页面隐藏时，释放 Wake Lock（系统会自动释放，但我们也主动释放）
-        releaseWakeLock();
-      }
-    };
-
-    document.addEventListener('visibilitychange', handleVisibilityChange);
-
-    return () => {
-      if (danmakuVisibleRestoreTimerRef.current) {
-        clearTimeout(danmakuVisibleRestoreTimerRef.current);
-        danmakuVisibleRestoreTimerRef.current = null;
-      }
-
-      // 清理定时器
-      if (saveIntervalRef.current) {
-        clearInterval(saveIntervalRef.current);
-      }
-
-      // 释放 Wake Lock
-      releaseWakeLock();
-
-      // 移除可见性监听
-      document.removeEventListener('visibilitychange', handleVisibilityChange);
-
-      // 停止前向预缓存（含下一集预热队列）
-      restartPrefetchForSkipRef.current = null;
-      prefetcherRef.current.stop();
-      getNextEpisodePrefetcher().stop();
-
-      // 销毁播放器实例
-      cleanupPlayer();
-    };
-  }, []);
-
-  // -----------------------------------------------------------------------------
-  // 弹幕选择回调（供渲染层绑定 DanmakuSelector）
-  // -----------------------------------------------------------------------------
-
-  const handleDanmakuSelect = (anime: AnimeOption, episodeNumber?: number) => {
-    const sourceName = anime.animeTitle;
-    setSelectedDanmakuSource(sourceName);
-    selectedDanmakuSourceRef.current = sourceName;
-    setShowDanmakuSelector(false);
-    setSelectedDanmakuAnime(anime);
-    setSelectedDanmakuEpisode(episodeNumber);
-    setSelectedState(true);
-    // 重复确认同一来源时依赖项不会变化，这里显式触发一次加载流程
-    setDanmakuSelectNonce((n) => n + 1);
-  };
-
-  const handleDanmakuClose = () => {
-    setShowDanmakuSelector(false);
-    // 更新 tooltip（走 DOM setter，不触发面板重建）
-    setSettingTooltip(
-      artPlayerRef.current,
-      DANMAKU_SETTING_NAME,
-      currentTooltip || '未选择'
-    );
-  };
-
-  // -----------------------------------------------------------------------------
-  // 返回给渲染层
-  // -----------------------------------------------------------------------------
-
-  return {
-    // 加载 / 错误
-    loading,
-    loadingStage,
-    loadingMessage,
-    error,
-    // 视频与元数据
-    detail,
-    totalEpisodes,
-    videoTitle,
-    videoYear,
-    videoDoubanId,
-    currentSource,
-    currentId,
-    searchTitle,
-    currentEpisodeIndex,
-    videoUrl,
-    skipConfig,
-    // 播放器
-    artRef,
-    playerHost,
-    preview,
-    isVideoLoading,
-    videoLoadingStage,
-    setLoading,
-    setIsVideoLoading,
-    setVideoLoadingStage,
-    // 源 / 换源
-    availableSources,
-    sourceSearchLoading,
-    sourceSearchError,
-    precomputedVideoInfo,
-    preferBestSource,
-    handleSourceChange,
-    handleEpisodeChange,
-    // 弹幕
-    showDanmakuSelector,
-    isDanmakuLoading,
-    handleDanmakuSelect,
-    handleDanmakuClose,
-    // 缓存管理
-    showCacheManager,
-    setShowCacheManager,
-    // 收藏 / 追更
-    favorited,
-    following,
-    handleToggleFavorite,
-    handleToggleFollowing,
-  };
-}
+        // 2) 明确要求"不设时间上限"：把整
