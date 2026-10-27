@@ -107,7 +107,7 @@ export interface CacheSettings {
 }
 
 export const DEFAULT_CACHE_SETTINGS: CacheSettings = {
-  enabled: false,
+  enabled: true, // 默认开启本地视频缓存
   autoClearOnEpisodeChange: false,
   concurrency: CACHE_CONCURRENCY_PRESETS.low,
   concurrencyMode: 'low',
